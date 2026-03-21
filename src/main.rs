@@ -1,9 +1,10 @@
-use std::{
-    collections::HashMap,
-    io::{self, BufRead, BufReader, Read, Write},
+use std::{collections::HashMap, sync::Arc};
+
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
-    sync::{Arc, Mutex, RwLock},
-    thread,
+    spawn,
+    sync::RwLock,
 };
 
 struct KVStore {
@@ -29,81 +30,98 @@ impl KVStore {
         self.data.remove(key).is_some()
     }
 }
-fn main() {
+#[tokio::main]
+async fn main() {
     let store = Arc::new(RwLock::new(KVStore::new()));
-    let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                let store_clone = Arc::clone(&store);
-                thread::spawn(move || {
-                    let mut buf_reader = BufReader::new(stream.try_clone().unwrap());
-                    loop {
-                        let mut input = String::new();
+    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
 
-                        let bytes_read = buf_reader.read_line(&mut input).unwrap();
-                        if bytes_read == 0 {
-                            break;
-                        };
-                        let mut args = input.trim().split_whitespace();
-                        let Some(cmd) = args.next() else {
-                            continue;
-                        };
+    loop {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let store_clone = Arc::clone(&store);
+        spawn(async move {
+            let (reader, mut writer) = stream.into_split();
+            let mut buf_reader = BufReader::new(reader);
 
-                        match cmd.to_uppercase().as_str() {
-                            "SET" => {
-                                let key = args.next();
-                                let value = args.next();
+            loop {
+                let mut input = String::new();
 
-                                if let (Some(k), Some(v)) = (key, value) {
-                                    let mut locked_store = store_clone.write().unwrap();
-                                    locked_store.set_value(k.to_string(), v.to_string());
+                let bytes_read = buf_reader.read_line(&mut input).await.unwrap();
 
-                                    let _ = stream.write_all("OK\n".as_bytes());
-                                }
+                if bytes_read == 0 {
+                    break;
+                }
+
+                let mut args = input.split_whitespace();
+
+                let Some(cmd) = args.next() else {
+                    continue;
+                };
+
+                match cmd.to_uppercase().as_str() {
+                    "GET" => {
+                        if let Some(arg) = args.next() {
+                            let value_to_send = {
+                                let locked_store = store_clone.read().await;
+
+                                locked_store.get_value(arg).cloned()
+                            };
+                            if let Some(val) = value_to_send {
+                                let res = format!("{}\n", val);
+                                let _ = writer.write_all(res.as_bytes()).await.unwrap();
+                            } else {
+                                let _ = writer.write_all("(nil)".as_bytes()).await.unwrap();
                             }
-                            "GET" => {
-                                if let Some(arg) = args.next() {
-                                    let locked_store = store_clone.read().unwrap();
-                                    let response = locked_store.get_value(arg);
-                                    match response {
-                                        Some(val) => {
-                                            let res = format!("{}\n", val);
-                                            let _ = stream.write_all(res.as_bytes());
-                                        }
-                                        None => {
-                                            let _ = stream.write_all("(nil)".as_bytes());
-                                        }
-                                    }
-                                } else {
-                                    let _ = stream
-                                        .write_all("Missing args for get request\n".as_bytes());
-                                }
-                            }
-                            "DEL" => {
-                                if let Some(arg) = args.next() {
-                                    let mut locked_store = store_clone.write().unwrap();
-                                    let response = locked_store.del_value(arg);
-                                    if response {
-                                        let _ = stream.write_all("1\n".as_bytes());
-                                    } else {
-                                        let _ = stream.write_all("0\n".as_bytes());
-                                    }
-                                } else {
-                                    let _ = stream.write_all("Missing args for DEL".as_bytes());
-                                }
-                            }
-                            _ => {
-                                let _ = stream.write_all("Invalid Input\n".as_bytes());
-                            }
+                        } else {
+                            let _ = writer
+                                .write_all("Missing args for GET".as_bytes())
+                                .await
+                                .unwrap();
                         }
                     }
-                });
+                    "SET" => {
+                        let key = args.next();
+                        let value = args.next();
+
+                        if let (Some(k), Some(v)) = (key, value) {
+                            {
+                                let mut locked_store = store_clone.write().await;
+                                locked_store.set_value(k.to_string(), v.to_string());
+                            }
+                            let _ = writer.write_all("OK\n".as_bytes()).await.unwrap();
+                        } else {
+                            let _ = writer
+                                .write_all("Missing args for SET".as_bytes())
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    "DEL" => {
+                        if let Some(arg) = args.next() {
+                            let response = {
+                                let mut locked_store = store_clone.write().await;
+                                locked_store.del_value(arg)
+                            };
+                            if response {
+                                let _ = writer.write_all("1\n".as_bytes()).await.unwrap();
+                            } else {
+                                let _ = writer.write_all("0\n".as_bytes()).await.unwrap();
+                            }
+                        } else {
+                            let _ = writer
+                                .write_all("Missing args for DEL".as_bytes())
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    _ => {
+                        let _ = writer
+                            .write_all("Invalid request".as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                }
             }
-            Err(e) => {
-                eprintln!("Erro Occured: {}", e);
-            }
-        };
+        });
     }
 }
