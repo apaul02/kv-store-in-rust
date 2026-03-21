@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use tokio::{
+    fs::OpenOptions,
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
     spawn,
@@ -29,15 +30,44 @@ impl KVStore {
     fn del_value(&mut self, key: &str) -> bool {
         self.data.remove(key).is_some()
     }
+
+    fn apply_command(&mut self, command_string: &str) {
+        let mut args = command_string.split_whitespace();
+
+        let Some(cmd) = args.next() else {
+            return;
+        };
+
+        match cmd.to_uppercase().as_str() {
+            "SET" => {
+                if let (Some(k), Some(v)) = (args.next(), args.next()) {
+                    self.set_value(k.to_string(), v.to_string());
+                }
+            }
+            "DEL" => {
+                if let Some(k) = args.next() {
+                    self.del_value(k);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 #[tokio::main]
 async fn main() {
-    let store = Arc::new(RwLock::new(KVStore::new()));
+    let mut store = KVStore::new();
+    if std::path::Path::new("store.aof").exists() {
+        let file = std::fs::read_to_string("store.aof").unwrap();
+        for line in file.lines() {
+            store.apply_command(line);
+        }
+    }
+    let store = Arc::new(RwLock::new(store));
 
     let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
 
     loop {
-        let (mut stream, _) = listener.accept().await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
         let store_clone = Arc::clone(&store);
         spawn(async move {
             let (reader, mut writer) = stream.into_split();
@@ -68,12 +98,12 @@ async fn main() {
                             };
                             if let Some(val) = value_to_send {
                                 let res = format!("{}\n", val);
-                                let _ = writer.write_all(res.as_bytes()).await.unwrap();
+                                writer.write_all(res.as_bytes()).await.unwrap();
                             } else {
-                                let _ = writer.write_all("(nil)".as_bytes()).await.unwrap();
+                                writer.write_all("(nil)".as_bytes()).await.unwrap();
                             }
                         } else {
-                            let _ = writer
+                            writer
                                 .write_all("Missing args for GET".as_bytes())
                                 .await
                                 .unwrap();
@@ -88,9 +118,17 @@ async fn main() {
                                 let mut locked_store = store_clone.write().await;
                                 locked_store.set_value(k.to_string(), v.to_string());
                             }
-                            let _ = writer.write_all("OK\n".as_bytes()).await.unwrap();
+                            let mut file = OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open("store.aof")
+                                .await
+                                .unwrap();
+                            let log_entry = format!("SET {} {}\n", k, v);
+                            file.write_all(log_entry.as_bytes()).await.unwrap();
+                            writer.write_all("OK\n".as_bytes()).await.unwrap();
                         } else {
-                            let _ = writer
+                            writer
                                 .write_all("Missing args for SET".as_bytes())
                                 .await
                                 .unwrap();
@@ -103,19 +141,27 @@ async fn main() {
                                 locked_store.del_value(arg)
                             };
                             if response {
-                                let _ = writer.write_all("1\n".as_bytes()).await.unwrap();
+                                let mut file = OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open("store.aof")
+                                    .await
+                                    .unwrap();
+                                let log_entry = format!("DEL {}\n", arg);
+                                file.write_all(log_entry.as_bytes()).await.unwrap();
+                                writer.write_all("1\n".as_bytes()).await.unwrap();
                             } else {
-                                let _ = writer.write_all("0\n".as_bytes()).await.unwrap();
+                                writer.write_all("0\n".as_bytes()).await.unwrap();
                             }
                         } else {
-                            let _ = writer
+                            writer
                                 .write_all("Missing args for DEL".as_bytes())
                                 .await
                                 .unwrap();
                         }
                     }
                     _ => {
-                        let _ = writer
+                        writer
                             .write_all("Invalid request".as_bytes())
                             .await
                             .unwrap();
