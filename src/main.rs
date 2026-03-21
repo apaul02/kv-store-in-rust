@@ -1,6 +1,9 @@
 use std::{
     collections::HashMap,
-    io::{self, Write},
+    io::{self, BufRead, BufReader, Read, Write},
+    net::TcpListener,
+    sync::{Arc, Mutex, RwLock},
+    thread,
 };
 
 struct KVStore {
@@ -27,65 +30,80 @@ impl KVStore {
     }
 }
 fn main() {
-    let mut store = KVStore::new();
-    loop {
-        let mut input = String::new();
+    let store = Arc::new(RwLock::new(KVStore::new()));
+    let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
 
-        print!("db> ");
-        io::stdout().flush().unwrap();
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut stream) => {
+                let store_clone = Arc::clone(&store);
+                thread::spawn(move || {
+                    let mut buf_reader = BufReader::new(stream.try_clone().unwrap());
+                    loop {
+                        let mut input = String::new();
 
-        io::stdin()
-            .read_line(&mut input)
-            .expect("Faild to read input");
+                        let bytes_read = buf_reader.read_line(&mut input).unwrap();
+                        if bytes_read == 0 {
+                            break;
+                        };
+                        let mut args = input.trim().split_whitespace();
+                        let Some(cmd) = args.next() else {
+                            continue;
+                        };
 
-        let input = input.trim();
+                        match cmd.to_uppercase().as_str() {
+                            "SET" => {
+                                let key = args.next();
+                                let value = args.next();
 
-        if input == "exit" {
-            break;
-        }
+                                if let (Some(k), Some(v)) = (key, value) {
+                                    let mut locked_store = store_clone.write().unwrap();
+                                    locked_store.set_value(k.to_string(), v.to_string());
 
-        let mut args = input.split_whitespace();
-
-        let Some(cmd) = args.next() else {
-            continue;
+                                    let _ = stream.write_all("OK\n".as_bytes());
+                                }
+                            }
+                            "GET" => {
+                                if let Some(arg) = args.next() {
+                                    let locked_store = store_clone.read().unwrap();
+                                    let response = locked_store.get_value(arg);
+                                    match response {
+                                        Some(val) => {
+                                            let res = format!("{}\n", val);
+                                            let _ = stream.write_all(res.as_bytes());
+                                        }
+                                        None => {
+                                            let _ = stream.write_all("(nil)".as_bytes());
+                                        }
+                                    }
+                                } else {
+                                    let _ = stream
+                                        .write_all("Missing args for get request\n".as_bytes());
+                                }
+                            }
+                            "DEL" => {
+                                if let Some(arg) = args.next() {
+                                    let mut locked_store = store_clone.write().unwrap();
+                                    let response = locked_store.del_value(arg);
+                                    if response {
+                                        let _ = stream.write_all("1\n".as_bytes());
+                                    } else {
+                                        let _ = stream.write_all("0\n".as_bytes());
+                                    }
+                                } else {
+                                    let _ = stream.write_all("Missing args for DEL".as_bytes());
+                                }
+                            }
+                            _ => {
+                                let _ = stream.write_all("Invalid Input\n".as_bytes());
+                            }
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                eprintln!("Erro Occured: {}", e);
+            }
         };
-
-        match cmd.to_uppercase().as_str() {
-            "GET" => {
-                if let Some(key) = args.next() {
-                    match store.get_value(key) {
-                        Some(val) => println!("\"{}\"", val),
-                        None => println!("(nil)"),
-                    }
-                } else {
-                    println!("(error) ERR wrong number of arguments for 'get' command");
-                }
-            }
-            "SET" => {
-                let key = args.next();
-                let value = args.next();
-
-                if let (Some(k), Some(v)) = (key, value) {
-                    store.set_value(k.to_string(), v.to_string());
-                    println!("OK");
-                } else {
-                    println!("(error) ERR wrong number of arguments for 'set' command");
-                }
-            }
-            "DEL" => {
-                if let Some(k) = args.next() {
-                    if store.del_value(k) {
-                        println!("(integer) 1");
-                    } else {
-                        println!("(integer) 0");
-                    }
-                } else {
-                    println!("(error) ERR wrong number of arguments for DEL");
-                }
-            }
-            _ => {
-                println!("Please enter a valid command");
-            }
-        }
     }
 }
