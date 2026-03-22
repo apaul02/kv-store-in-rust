@@ -9,6 +9,9 @@ IronKV is a highly concurrent, persistent, in-memory key-value database built en
 * **LSM-Tree Storage Engine:** Bypasses physical RAM limitations by buffering writes in memory and flushing immutable, sorted datasets to disk.
   * **MemTable:** Uses a `BTreeMap` for fast, automatically sorted in-memory inserts.
   * **SSTables:** Periodically flushes the MemTable to immutable Sorted String Tables on disk.
+* **Optimized Read Path ($O(\log n)$):**
+  * **Bloom Filters:** Utilizes in-memory probabilistic data structures to achieve $O(1)$ negative lookups, completely bypassing slow disk reads for missing keys.
+  * **Binary Search:** Seeks through alphabetized SSTables using $O(\log n)$ binary search instead of $O(n)$ linear scans.
 * **Durability & Crash Recovery:** Implements a Write-Ahead Log (WAL) via an Append-Only File (AOF) to ensure no data loss occurs between MemTable flushes in the event of a power failure.
 * **Background Compaction:** Automatically merges and compacts older SSTables, reclaiming disk space and permanently purging deleted keys.
 * **Append-Only Deletions:** Uses Tombstone markers (`__TOMBSTONE__`) to safely handle data deletions in an immutable storage architecture.
@@ -57,6 +60,6 @@ DEL lang
 
 ## Future Enhancements
 
-* [ ] **Binary Search**: Upgrade the SSTable read path to utilize binary search byte-offsets for O(logn) disk reads.
-* [ ] **Bloom Filters**: Implement in-memory probabilistic data structures to skip searching SSTables that do not contain the requested key.
+* [x] **Binary Search**: Upgrade the SSTable read path to utilize binary search byte-offsets for O(logn) disk reads.
+* [x] **Bloom Filters**: Implement in-memory probabilistic data structures to skip searching SSTables that do not contain the requested key.
 * [ ] **RESP Protocol**: Migrate the custom text protocol to the standard Redis Serialization Protocol (RESP) to enable compatibility with the official redis-cli.

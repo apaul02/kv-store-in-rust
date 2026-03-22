@@ -1,6 +1,7 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs,
+    hash::DefaultHasher,
     io::Write,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -14,9 +15,12 @@ use tokio::{
     sync::RwLock,
 };
 
+use std::hash::{Hash, Hasher};
+
 struct KVStore {
     data: BTreeMap<String, String>,
     memtable_size: usize,
+    bloom_filter: HashMap<String, BloomFilter>,
 }
 
 impl KVStore {
@@ -24,6 +28,7 @@ impl KVStore {
         KVStore {
             data: BTreeMap::new(),
             memtable_size: 0,
+            bloom_filter: HashMap::new(),
         }
     }
 
@@ -50,13 +55,18 @@ impl KVStore {
                 .filter(|entry| {
                     entry.path().extension().and_then(|ext| ext.to_str()) == Some("sst")
                 })
-                .map(|entry| entry.path().to_str().unwrap().to_string())
+                .map(|entry| entry.file_name().into_string().unwrap())
                 .collect();
 
             sstfiles.sort();
             sstfiles.reverse();
 
             for file_path in sstfiles {
+                if let Some(filter) = self.bloom_filter.get(&file_path) {
+                    if !filter.contains(key) {
+                        continue;
+                    }
+                }
                 if let Ok(contents) = fs::read_to_string(&file_path) {
                     let lines: Vec<&str> = contents.lines().collect();
                     let search_result = lines.binary_search_by(|line| {
@@ -126,6 +136,12 @@ impl KVStore {
             let log = format!("{},{}\n", key, value);
             file.write_all(log.as_bytes()).unwrap();
         }
+        let mut filter = BloomFilter::new(10000);
+
+        for key in self.data.keys() {
+            filter.insert(key);
+        }
+        self.bloom_filter.insert(filename, filter);
         self.data.clear();
         self.memtable_size = 0;
         std::fs::File::create("store.aof").unwrap();
@@ -151,7 +167,7 @@ impl KVStore {
                 .filter(|entry| {
                     entry.path().extension().and_then(|ext| ext.to_str()) == Some("sst")
                 })
-                .map(|entry| entry.path().to_str().unwrap().to_string())
+                .map(|entry| entry.file_name().into_string().unwrap())
                 .collect();
 
             sstfiles.sort();
@@ -178,10 +194,60 @@ impl KVStore {
                 file.write_all(log.as_bytes()).unwrap();
             }
 
+            self.bloom_filter.clear();
+            let mut master_filter = BloomFilter::new(10000);
+            for key in temp_map.keys() {
+                master_filter.insert(key);
+            }
+
+            self.bloom_filter.insert(filename, master_filter);
+
             for file_path in sstfiles {
                 std::fs::remove_file(&file_path).unwrap();
             }
         }
+    }
+}
+
+struct BloomFilter {
+    bit_array: Vec<bool>,
+}
+
+impl BloomFilter {
+    fn new(size: usize) -> BloomFilter {
+        BloomFilter {
+            bit_array: vec![false; size],
+        }
+    }
+
+    fn get_indices(&self, key: &str) -> Vec<usize> {
+        let mut indices = Vec::new();
+        for i in 0..3 {
+            let mut hasher = DefaultHasher::new();
+            let hash_key = format!("{}{}", key, i);
+            hash_key.hash(&mut hasher);
+
+            let index = (hasher.finish() as usize) % self.bit_array.len();
+            indices.push(index);
+        }
+        indices
+    }
+
+    fn insert(&mut self, key: &str) {
+        let indices = self.get_indices(key);
+        for index in indices {
+            self.bit_array[index] = true;
+        }
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        let indices = self.get_indices(key);
+        for index in indices {
+            if !self.bit_array[index] {
+                return false;
+            }
+        }
+        true
     }
 }
 #[tokio::main]
@@ -191,6 +257,22 @@ async fn main() {
         let file = std::fs::read_to_string("store.aof").unwrap();
         for line in file.lines() {
             store.apply_command(line);
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(".") {
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|ext| ext.to_str()) == Some("sst") {
+                let filename = entry.file_name().into_string().unwrap();
+                let mut filter = BloomFilter::new(10000);
+                if let Ok(contents) = std::fs::read_to_string(&filename) {
+                    for line in contents.lines() {
+                        if let Some((k, _)) = line.split_once(',') {
+                            filter.insert(k);
+                        }
+                    }
+                }
+                store.bloom_filter.insert(filename, filter);
+            }
         }
     }
     let store = Arc::new(RwLock::new(store));
