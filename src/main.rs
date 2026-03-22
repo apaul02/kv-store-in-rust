@@ -120,6 +120,59 @@ impl KVStore {
         self.data.clear();
         self.memtable_size = 0;
         std::fs::File::create("store.aof").unwrap();
+
+        if let Ok(entries) = fs::read_dir(".") {
+            let sst_count = entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry.path().extension().and_then(|ext| ext.to_str()) == Some("sst")
+                })
+                .count();
+            if sst_count > 5 {
+                println!("Too many SSTables ({}). triggering compaction!", sst_count);
+                self.compact_sstables();
+            }
+        }
+    }
+
+    fn compact_sstables(&mut self) {
+        if let Ok(entries) = fs::read_dir(".") {
+            let mut sstfiles: Vec<String> = entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry.path().extension().and_then(|ext| ext.to_str()) == Some("sst")
+                })
+                .map(|entry| entry.path().to_str().unwrap().to_string())
+                .collect();
+
+            sstfiles.sort();
+            let mut temp_map = BTreeMap::new();
+
+            for file_path in &sstfiles {
+                if let Ok(contents) = fs::read_to_string(&file_path) {
+                    for line in contents.lines() {
+                        if let Some((k, v)) = line.split_once(',') {
+                            temp_map.insert(k.to_string(), v.to_string());
+                        }
+                    }
+                }
+            }
+            temp_map.retain(|_, v| v != "__TOMBSTONE__");
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            let filename = format!("sstable_{}.sst", timestamp);
+            let mut file = std::fs::File::create(&filename).unwrap();
+            for (key, value) in &temp_map {
+                let log = format!("{},{}\n", key, value);
+                file.write_all(log.as_bytes()).unwrap();
+            }
+
+            for file_path in sstfiles {
+                std::fs::remove_file(&file_path).unwrap();
+            }
+        }
     }
 }
 #[tokio::main]
