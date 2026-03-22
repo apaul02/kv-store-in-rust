@@ -58,12 +58,21 @@ impl KVStore {
 
             for file_path in sstfiles {
                 if let Ok(contents) = fs::read_to_string(&file_path) {
-                    for line in contents.lines() {
-                        if let Some((k, v)) = line.split_once(',') {
-                            if k == key {
-                                if v == "__TOMBSTONE__" {
-                                    return None;
-                                }
+                    let lines: Vec<&str> = contents.lines().collect();
+                    let search_result = lines.binary_search_by(|line| {
+                        if let Some((file_key, _file_name)) = line.split_once(',') {
+                            file_key.cmp(key)
+                        } else {
+                            std::cmp::Ordering::Equal
+                        }
+                    });
+
+                    if let Ok(index) = search_result {
+                        let found_line = lines[index];
+                        if let Some((_, v)) = found_line.split_once(',') {
+                            if v == "__TOMBSTONE__" {
+                                return None;
+                            } else {
                                 return Some(v.to_string());
                             }
                         }
