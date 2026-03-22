@@ -1,4 +1,10 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::Write,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use tokio::{
     fs::OpenOptions,
@@ -9,26 +15,74 @@ use tokio::{
 };
 
 struct KVStore {
-    data: HashMap<String, String>,
+    data: BTreeMap<String, String>,
+    memtable_size: usize,
 }
 
 impl KVStore {
     fn new() -> KVStore {
         KVStore {
-            data: HashMap::new(),
+            data: BTreeMap::new(),
+            memtable_size: 0,
         }
     }
 
     fn set_value(&mut self, key: String, value: String) {
+        let size = key.len() + value.len();
+        self.memtable_size += size;
+        if self.memtable_size > 1000 {
+            self.flush_memtable();
+        }
         let _ = self.data.insert(key, value);
     }
 
-    fn get_value(&self, key: &str) -> Option<&String> {
-        self.data.get(key)
+    fn get_value(&self, key: &str) -> Option<String> {
+        if let Some(val) = self.data.get(key) {
+            if val == "__TOMBSTONE__" {
+                return None;
+            }
+            return Some(val.clone());
+        }
+
+        if let Ok(entries) = fs::read_dir(".") {
+            let mut sstfiles: Vec<String> = entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry.path().extension().and_then(|ext| ext.to_str()) == Some("sst")
+                })
+                .map(|entry| entry.path().to_str().unwrap().to_string())
+                .collect();
+
+            sstfiles.sort();
+            sstfiles.reverse();
+
+            for file_path in sstfiles {
+                if let Ok(contents) = fs::read_to_string(&file_path) {
+                    for line in contents.lines() {
+                        if let Some((k, v)) = line.split_once(',') {
+                            if k == key {
+                                if v == "__TOMBSTONE__" {
+                                    return None;
+                                }
+                                return Some(v.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn del_value(&mut self, key: &str) -> bool {
-        self.data.remove(key).is_some()
+        let size = key.len() + "__TOMBSTONE__".len();
+        self.memtable_size += size;
+        if self.memtable_size > 1000 {
+            self.flush_memtable();
+        }
+        self.data
+            .insert(key.to_string(), "__TOMBSTONE__".to_string())
+            .is_some()
     }
 
     fn apply_command(&mut self, command_string: &str) {
@@ -51,6 +105,21 @@ impl KVStore {
             }
             _ => {}
         }
+    }
+    fn flush_memtable(&mut self) {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let filename = format!("sstable_{}.sst", timestamp);
+        let mut file = std::fs::File::create(&filename).unwrap();
+        for (key, value) in &self.data {
+            let log = format!("{},{}\n", key, value);
+            file.write_all(log.as_bytes()).unwrap();
+        }
+        self.data.clear();
+        self.memtable_size = 0;
+        std::fs::File::create("store.aof").unwrap();
     }
 }
 #[tokio::main]
@@ -94,7 +163,7 @@ async fn main() {
                             let value_to_send = {
                                 let locked_store = store_clone.read().await;
 
-                                locked_store.get_value(arg).cloned()
+                                locked_store.get_value(arg)
                             };
                             if let Some(val) = value_to_send {
                                 let res = format!("{}\n", val);
