@@ -17,8 +17,14 @@ use tokio::{
 
 use std::hash::{Hash, Hasher};
 
+#[derive(Debug, Clone)]
+struct StoreValue {
+    data: String,
+    expiration: Option<u128>,
+}
+
 struct KVStore {
-    data: BTreeMap<String, String>,
+    data: BTreeMap<String, StoreValue>,
     memtable_size: usize,
     bloom_filter: HashMap<String, BloomFilter>,
 }
@@ -32,21 +38,37 @@ impl KVStore {
         }
     }
 
-    fn set_value(&mut self, key: String, value: String) {
+    fn set_value(&mut self, key: String, value: String, expiration: Option<u128>) {
         let size = key.len() + value.len();
         self.memtable_size += size;
         if self.memtable_size > 1000 {
             self.flush_memtable();
         }
-        let _ = self.data.insert(key, value);
+        let _ = self.data.insert(
+            key,
+            StoreValue {
+                data: value,
+                expiration,
+            },
+        );
     }
 
     fn get_value(&self, key: &str) -> Option<String> {
         if let Some(val) = self.data.get(key) {
-            if val == "__TOMBSTONE__" {
+            if val.data == "__TOMBSTONE__" {
                 return None;
             }
-            return Some(val.clone());
+            if let Some(timestamp) = val.expiration {
+                if SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+                    > timestamp
+                {
+                    return None;
+                }
+            }
+            return Some(val.data.clone());
         }
 
         if let Ok(entries) = fs::read_dir(".") {
@@ -80,10 +102,22 @@ impl KVStore {
                     if let Ok(index) = search_result {
                         let found_line = lines[index];
                         if let Some((_, v)) = found_line.split_once(',') {
-                            if v == "__TOMBSTONE__" {
-                                return None;
-                            } else {
-                                return Some(v.to_string());
+                            if let Some((timestamp, v)) = v.split_once(',') {
+                                let exp_time = timestamp.parse::<u128>().unwrap_or(0);
+                                if exp_time > 0
+                                    && SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_millis()
+                                        > exp_time
+                                {
+                                    return None;
+                                }
+                                if v == "__TOMBSTONE__" {
+                                    return None;
+                                } else {
+                                    return Some(v.to_string());
+                                }
                             }
                         }
                     }
@@ -100,7 +134,13 @@ impl KVStore {
             self.flush_memtable();
         }
         self.data
-            .insert(key.to_string(), "__TOMBSTONE__".to_string())
+            .insert(
+                key.to_string(),
+                StoreValue {
+                    data: "__TOMBSTONE__".to_string(),
+                    expiration: None,
+                },
+            )
             .is_some()
     }
 
@@ -113,8 +153,14 @@ impl KVStore {
 
         match cmd.to_uppercase().as_str() {
             "SET" => {
-                if let (Some(k), Some(v)) = (args.next(), args.next()) {
-                    self.set_value(k.to_string(), v.to_string());
+                if let (Some(k), Some(t), Some(v)) = (args.next(), args.next(), args.next()) {
+                    let timestamp = t.parse::<u128>().unwrap_or(0);
+                    let tx = if timestamp == 0 {
+                        None
+                    } else {
+                        Some(timestamp)
+                    };
+                    self.set_value(k.to_string(), v.to_string(), tx);
                 }
             }
             "DEL" => {
@@ -133,7 +179,7 @@ impl KVStore {
         let filename = format!("sstable_{}.sst", timestamp);
         let mut file = std::fs::File::create(&filename).unwrap();
         for (key, value) in &self.data {
-            let log = format!("{},{}\n", key, value);
+            let log = format!("{},{},{}\n", key, value.expiration.unwrap_or(0), value.data);
             file.write_all(log.as_bytes()).unwrap();
         }
         let mut filter = BloomFilter::new(10000);
@@ -171,18 +217,40 @@ impl KVStore {
                 .collect();
 
             sstfiles.sort();
-            let mut temp_map = BTreeMap::new();
+            let mut temp_map: BTreeMap<String, StoreValue> = BTreeMap::new();
 
             for file_path in &sstfiles {
                 if let Ok(contents) = fs::read_to_string(&file_path) {
                     for line in contents.lines() {
                         if let Some((k, v)) = line.split_once(',') {
-                            temp_map.insert(k.to_string(), v.to_string());
+                            if let Some((t, d)) = v.split_once(',') {
+                                let timestamp = t.parse::<u128>().unwrap();
+                                let current_time = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_millis();
+                                if timestamp > 0 && current_time > timestamp {
+                                    continue;
+                                }
+
+                                let exp_option = if timestamp == 0 {
+                                    None
+                                } else {
+                                    Some(timestamp)
+                                };
+                                temp_map.insert(
+                                    k.to_string(),
+                                    StoreValue {
+                                        data: d.to_string(),
+                                        expiration: exp_option,
+                                    },
+                                );
+                            }
                         }
                     }
                 }
             }
-            temp_map.retain(|_, v| v != "__TOMBSTONE__");
+            temp_map.retain(|_, v| v.data != "__TOMBSTONE__");
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -190,7 +258,7 @@ impl KVStore {
             let filename = format!("sstable_{}.sst", timestamp);
             let mut file = std::fs::File::create(&filename).unwrap();
             for (key, value) in &temp_map {
-                let log = format!("{},{}\n", key, value);
+                let log = format!("{},{},{}\n", key, value.expiration.unwrap_or(0), value.data);
                 file.write_all(log.as_bytes()).unwrap();
             }
 
@@ -346,9 +414,26 @@ async fn main() {
                             let key = &args[1];
                             let value = &args[2];
 
+                            let expiration: Option<u128> =
+                                if args.len() >= 5 && args[3].to_uppercase() == "EX" {
+                                    let now = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_millis();
+                                    let parserd_seconds = args[4].parse::<u128>().unwrap_or(0);
+                                    let ex = (parserd_seconds * 1000) + now;
+                                    Some(ex)
+                                } else {
+                                    None
+                                };
+
                             {
                                 let mut locked_store = store_clone.write().await;
-                                locked_store.set_value(key.to_string(), value.to_string());
+                                locked_store.set_value(
+                                    key.to_string(),
+                                    value.to_string(),
+                                    expiration,
+                                )
                             }
 
                             let mut file = OpenOptions::new()
@@ -357,7 +442,8 @@ async fn main() {
                                 .open("store.aof")
                                 .await
                                 .unwrap();
-                            let log_entry = format!("SET {} {}\n", key, value);
+                            let log_entry =
+                                format!("SET {} {} {}\n", key, expiration.unwrap_or(0), value);
                             file.write_all(log_entry.as_bytes()).await.unwrap();
 
                             writer.write_all("+OK\r\n".as_bytes()).await.unwrap();
