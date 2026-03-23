@@ -62,4 +62,4 @@ DEL lang
 
 * [x] **Binary Search**: Upgrade the SSTable read path to utilize binary search byte-offsets for O(logn) disk reads.
 * [x] **Bloom Filters**: Implement in-memory probabilistic data structures to skip searching SSTables that do not contain the requested key.
-* [ ] **RESP Protocol**: Migrate the custom text protocol to the standard Redis Serialization Protocol (RESP) to enable compatibility with the official redis-cli.
+* [x] **RESP Protocol**: Migrate the custom text protocol to the standard Redis Serialization Protocol (RESP) to enable compatibility with the official redis-cli.
