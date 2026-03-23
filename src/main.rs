@@ -287,72 +287,98 @@ async fn main() {
             let mut buf_reader = BufReader::new(reader);
 
             loop {
-                let mut input = String::new();
-
-                let bytes_read = buf_reader.read_line(&mut input).await.unwrap();
-
+                let mut line = String::new();
+                let bytes_read = buf_reader.read_line(&mut line).await.unwrap();
                 if bytes_read == 0 {
                     break;
                 }
 
-                let mut args = input.split_whitespace();
+                let mut args = Vec::new();
 
-                let Some(cmd) = args.next() else {
+                if line.starts_with('*') {
+                    let num_args: usize = line.trim()[1..].parse().unwrap_or(0);
+
+                    for _ in 0..num_args {
+                        line.clear();
+                        buf_reader.read_line(&mut line).await.unwrap();
+
+                        line.clear();
+                        buf_reader.read_line(&mut line).await.unwrap();
+                        args.push(line.trim().to_string());
+                    }
+                } else {
+                    args = line.split_whitespace().map(|s| s.to_string()).collect();
+                }
+
+                if args.is_empty() {
                     continue;
-                };
+                }
 
-                match cmd.to_uppercase().as_str() {
+                let cmd = args[0].to_uppercase();
+
+                match cmd.as_str() {
                     "GET" => {
-                        if let Some(arg) = args.next() {
+                        if args.len() > 1 {
+                            let key = &args[1];
                             let value_to_send = {
                                 let locked_store = store_clone.read().await;
-
-                                locked_store.get_value(arg)
+                                locked_store.get_value(key)
                             };
+
                             if let Some(val) = value_to_send {
-                                let res = format!("{}\n", val);
+                                let res = format!("${}\r\n{}\r\n", val.len(), val);
                                 writer.write_all(res.as_bytes()).await.unwrap();
                             } else {
-                                writer.write_all("(nil)".as_bytes()).await.unwrap();
+                                writer.write_all("$-1\r\n".as_bytes()).await.unwrap();
                             }
                         } else {
                             writer
-                                .write_all("Missing args for GET".as_bytes())
+                                .write_all(
+                                    "-ERR wrong number of arguments for 'get' command\r\n"
+                                        .as_bytes(),
+                                )
                                 .await
                                 .unwrap();
                         }
                     }
                     "SET" => {
-                        let key = args.next();
-                        let value = args.next();
+                        if args.len() > 2 {
+                            let key = &args[1];
+                            let value = &args[2];
 
-                        if let (Some(k), Some(v)) = (key, value) {
                             {
                                 let mut locked_store = store_clone.write().await;
-                                locked_store.set_value(k.to_string(), v.to_string());
+                                locked_store.set_value(key.to_string(), value.to_string());
                             }
+
                             let mut file = OpenOptions::new()
                                 .create(true)
                                 .append(true)
                                 .open("store.aof")
                                 .await
                                 .unwrap();
-                            let log_entry = format!("SET {} {}\n", k, v);
+                            let log_entry = format!("SET {} {}\n", key, value);
                             file.write_all(log_entry.as_bytes()).await.unwrap();
-                            writer.write_all("OK\n".as_bytes()).await.unwrap();
+
+                            writer.write_all("+OK\r\n".as_bytes()).await.unwrap();
                         } else {
                             writer
-                                .write_all("Missing args for SET".as_bytes())
+                                .write_all(
+                                    "-ERR wrong number of arguments for 'set' command\r\n"
+                                        .as_bytes(),
+                                )
                                 .await
                                 .unwrap();
                         }
                     }
                     "DEL" => {
-                        if let Some(arg) = args.next() {
+                        if args.len() > 1 {
+                            let key = &args[1];
                             let response = {
                                 let mut locked_store = store_clone.write().await;
-                                locked_store.del_value(arg)
+                                locked_store.del_value(key)
                             };
+
                             if response {
                                 let mut file = OpenOptions::new()
                                     .create(true)
@@ -360,24 +386,26 @@ async fn main() {
                                     .open("store.aof")
                                     .await
                                     .unwrap();
-                                let log_entry = format!("DEL {}\n", arg);
+                                let log_entry = format!("DEL {}\n", key);
                                 file.write_all(log_entry.as_bytes()).await.unwrap();
-                                writer.write_all("1\n".as_bytes()).await.unwrap();
+
+                                writer.write_all(":1\r\n".as_bytes()).await.unwrap();
                             } else {
-                                writer.write_all("0\n".as_bytes()).await.unwrap();
+                                writer.write_all(":0\r\n".as_bytes()).await.unwrap();
                             }
                         } else {
                             writer
-                                .write_all("Missing args for DEL".as_bytes())
+                                .write_all(
+                                    "-ERR wrong number of arguments for 'del' command\r\n"
+                                        .as_bytes(),
+                                )
                                 .await
                                 .unwrap();
                         }
                     }
                     _ => {
-                        writer
-                            .write_all("Invalid request".as_bytes())
-                            .await
-                            .unwrap();
+                        let err = format!("-ERR unknown command '{}'\r\n", cmd);
+                        writer.write_all(err.as_bytes()).await.unwrap();
                     }
                 }
             }
